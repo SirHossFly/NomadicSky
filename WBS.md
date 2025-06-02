@@ -103,3 +103,5 @@ Project Management:
 •	Concepts: Project closure, documentation.
 •	Actions: Finalize README, assess success criteria (e.g., MVP functionality).
 
+## Future Enhancements
+- **OpenWeatherMap APIs**: Noted additional APIs for post-MVP (e.g., 5-day forecast, air quality, geocoding) to enhance weather features like forecasting and health alerts for nomads.
