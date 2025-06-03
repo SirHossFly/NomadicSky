@@ -1,0 +1,7 @@
+"This is a sample structure for the user_prefs.json file. I'll add the final stucture when I get to the end of the project."
+
+{
+  "preferred_cities": ["SampleCity1", "SampleCity2"],
+  "temperature_preference": "cool",
+  "weather_condition_preference": "cloudy"
+}
