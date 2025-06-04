@@ -21,10 +21,21 @@ NOAA_API_KEY = load_api_key("NOAA_API_KEY")
 def read_user_prefs():
     try:
         with open("user_prefs.json", "r") as file:
-            return json.load(file)
+            prefs = json.load(file)
+            # Validate existing cities
+            if "preferred_cities" in prefs:
+                valid_cities = []
+                for city in prefs["preferred_cities"]:
+                    url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPENWEATHERMAP_API_KEY}"
+                    response = requests.get(url)
+                    if response.status_code == 200:
+                        valid_cities.append(city)
+                prefs["preferred_cities"] = valid_cities
+                write_user_prefs(prefs)  # Save updated preferences
+            return prefs
     except (FileNotFoundError, json.JSONDecodeError):
         # If file doesn't exist or is invalid, return default structure
-        return {"preferred_cities": [], "temperature_preference": None}
+        return {"preferred_cities": [], "temperature_preference": None, "weather_condition_preference": None}
 
 def write_user_prefs(prefs):
     with open("user_prefs.json", "w") as file:
@@ -233,6 +244,11 @@ def update_user_preferences(input_str):
         # Otherwise, assume it's a city (e.g., "I like Knoxville")
         else:
             city = input_str.split("I like", 1)[1].strip()
+            # Validate city using OpenWeatherMap API
+            url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPENWEATHERMAP_API_KEY}"
+            response = requests.get(url)
+            if response.status_code != 200:
+                return f"I couldn't find {city} to add it to your preferred cities. Could you try a different city, like 'Knoxville' or 'Tucson', or double-check the spelling?"
             if city not in prefs["preferred_cities"]:
                 prefs["preferred_cities"].append(city)
                 write_user_prefs(prefs)
@@ -256,7 +272,7 @@ def update_user_preferences(input_str):
 update_preferences_tool = Tool(
     name="update_user_preferences",
     func=update_user_preferences,
-    description="Updates user preferences, such as preferred cities, temperature preferences, or weather conditions. Input examples: 'I like Knoxville', 'I like sunny weather', 'I prefer warm weather'."
+    description="Updates user preferences, such as preferred cities, temperature preferences, or weather conditions. Validates cities before adding them. Input examples: 'I like Knoxville', 'I like sunny weather', 'I prefer warm weather'."
 )
 
 # Tool to retrieve user preferences
@@ -405,26 +421,89 @@ llm = ChatXAI(api_key=GROK3_API_KEY, model="grok-3-mini")
 
 # Create a conversational prompt
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a weather assistant for nomads. Use the tools to answer weather-related queries conversationally. For historical weather, provide the average highs and lows in a clear, friendly format. For weather forecasts, include the daily average temperature, high, low, and most frequent weather condition in a detailed, friendly response. Use the get_user_preferences tool to check user preferences when relevant (e.g., for weather queries, check preferred cities; for finding warm places, consider temperature preferences). You can also store user preferences like preferred cities or temperature preferences using the update_user_preferences tool."),
+    ("system", "You are a weather assistant for nomads. Use the tools to answer weather-related queries conversationally. For historical weather, provide the average highs and lows in a clear, friendly format. For weather forecasts, include the daily average temperature, high, low, and most frequent weather condition in a detailed, friendly response. Use the get_user_preferences tool to check user preferences when relevant (e.g., for queries like 'What's the weather in my preferred cities?', check preferred cities and apply preferences). For direct single-city weather queries (e.g., 'What's the weather in Knoxville?'), use weather_lookup directly without checking preferences unless explicitly asked. You can also store user preferences like preferred cities or temperature preferences using the update_user_preferences tool. For combined queries, break them down into separate tool calls: e.g., for 'What's the weather in Knoxville today, and what's the forecast for the next few days?', first use weather_lookup to get current weather, then use forecast_weather to get the forecast. For comparison queries (e.g., 'Compare the weather in Knoxville and Tucson this week'), invoke forecast_weather for each city separately (e.g., call forecast_weather for Knoxville, then for Tucson), and summarize the results. If a query involves both current weather and forecast, split it into two steps: use weather_lookup for 'today' and forecast_weather for future days. Always provide clear, actionable responses tailored for nomads on the move. If a query requires multiple steps, execute them sequentially and summarize the findings in a single response. If a query is preprocessed into simpler parts (e.g., 'What's the forecast for Knoxville?' and 'What's the forecast for Tucson?'), handle each part directly without attempting to combine tools like 'forecast_weatherforecast_weather'."),
     ("human", "{input}"),
     ("assistant", "{agent_scratchpad}")
 ])
 
+# Preprocess queries to handle combined queries explicitly
+def preprocess_query(query):
+    # Handle "today and forecast" queries
+    if "today" in query.lower() and "forecast" in query.lower():
+        # Split into two queries
+        try:
+            city = query.lower().split("in ")[1].split(" today")[0].strip()
+            return {"type": "today_and_forecast", "city": city, "queries": [
+                f"What's the weather in {city}?",
+                f"What's the forecast for {city}?"
+            ]}
+        except IndexError:
+            return {"type": "single", "queries": [query]}
+    # Handle comparison queries
+    if "compare" in query.lower() and "and" in query.lower():
+        # Extract cities
+        try:
+            parts = query.lower().split("in ")[1].split(" this week")[0]
+            cities = [city.strip() for city in parts.split(" and ")]
+            return {"type": "comparison", "cities": cities, "queries": [
+                f"What's the forecast for {city}?" for city in cities
+            ]}
+        except IndexError:
+            return {"type": "single", "queries": [query]}
+    # Default: return original query as a single-item list
+    return {"type": "single", "queries": [query]}
+
+# Wrap the agent executor to handle preprocessed queries
+class PreprocessedAgentExecutor:
+    def __init__(self, executor):
+        self.executor = executor
+
+    def invoke(self, input_dict):
+        query = input_dict["input"]
+        preprocessed = preprocess_query(query)
+        queries = preprocessed["queries"]
+        responses = []
+        for q in queries:
+            response = self.executor.invoke({"input": q})
+            responses.append(response["output"])
+        # Combine responses into a single output
+        if preprocessed["type"] == "today_and_forecast":
+            city = preprocessed["city"]
+            return {"output": f"Let’s break this down for {city.capitalize()}!\n\n**Today’s Weather:**\n{responses[0]}\n\n**Forecast for the Next Few Days:**\n{responses[1]}"}
+        elif preprocessed["type"] == "comparison":
+            cities = preprocessed["cities"]
+            return {"output": f"Here's a comparison of the weather in {cities[0].capitalize()} and {cities[1].capitalize()}:\n\n**{cities[0].capitalize()} Forecast:**\n{responses[0]}\n\n**{cities[1].capitalize()} Forecast:**\n{responses[1]}"}
+        return {"output": responses[0]}
+
 # Create the agent with tools
 tools = [weather_tool, warm_places_tool, historical_weather_tool, forecast_weather_tool, update_preferences_tool, get_preferences_tool]
 agent = create_tool_calling_agent(llm=llm, tools=tools, prompt=prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+base_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=20)
+agent_executor = PreprocessedAgentExecutor(base_executor)
 
-# Test the conversational agent with diverse forecast queries
+# Test the conversational agent with end-to-end diverse queries
 queries = [
+    # Reset preferences for a clean test
     "I like Knoxville",
     "I like Tucson",
     "I like sunny weather",
     "I prefer warm weather",
+    # Current weather queries
+    "What's the weather in Knoxville?",
+    "What's the weather in my preferred cities?",
+    # Historical weather queries
+    "What were the average highs and lows in Knoxville in June?",
+    "What were the average highs and lows in Tucson in December?",
+    # Forecast weather queries
     "What's the forecast for Knoxville?",
     "What's the forecast for my preferred cities?",
+    # Combined queries
+    "What's the weather in Knoxville today, and what's the forecast for the next few days?",
+    "Compare the weather in Knoxville and Tucson this week.",
+    # Edge cases
     "What's the forecast for InvalidCity?",
-    "What's the forecast for my preferred cities this week?",
+    "I like InvalidCity",
+    # Preference management
     "What are my preferences?"
 ]
 
