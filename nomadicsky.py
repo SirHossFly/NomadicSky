@@ -42,6 +42,67 @@ def get_current_weather(location):
         return {"city": city, "temp": temp, "description": description}
     else:
         return {"error": f"Error fetching weather for {location}: {response.status_code}"}
+    
+# Function to fetch 5-day weather forecast from OpenWeatherMap
+def get_weather_forecast(location):
+    # First, get coordinates for the location
+    url = f"https://api.openweathermap.org/data/2.5/weather?q={location}&appid={OPENWEATHERMAP_API_KEY}"
+    response = requests.get(url)
+    if response.status_code != 200:
+        # Suggest preferred cities if available
+        prefs = read_user_prefs()
+        preferred_cities = prefs.get("preferred_cities", [])
+        suggestion = f"Try a different city, like {', '.join(preferred_cities)} if you have any preferred cities set." if preferred_cities else "Try a different city, like 'Knoxville' or 'Tucson'."
+        return {"error": f"Could not find coordinates for {location}: {response.status_code}. {suggestion}"}
+    data = response.json()
+    lat = data["coord"]["lat"]
+    lon = data["coord"]["lon"]
+    city = data["name"]
+
+    # Fetch 5-day forecast (3-hourly data for 5 days = 40 data points)
+    url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={OPENWEATHERMAP_API_KEY}&units=imperial"
+    response = requests.get(url)
+    if response.status_code != 200:
+        return {"error": f"Error fetching forecast for {city}: {response.status_code}"}
+
+    data = response.json()
+    if "list" not in data or not data["list"]:
+        return {"error": f"No forecast data found for {city}."}
+
+    # Process forecast: summarize daily averages, highs, and lows
+    daily_forecasts = {}
+    for entry in data["list"]:
+        # Extract date (e.g., "2025-06-04 12:00:00" -> "2025-06-04")
+        date = entry["dt_txt"].split(" ")[0]
+        temp = entry["main"]["temp"]
+        description = entry["weather"][0]["description"]
+
+        if date not in daily_forecasts:
+            daily_forecasts[date] = {"temps": [], "descriptions": []}
+        daily_forecasts[date]["temps"].append(temp)
+        daily_forecasts[date]["descriptions"].append(description)
+
+    # Summarize each day: average, high, low temperature, most frequent weather description
+    forecast_summary = []
+    for date, info in daily_forecasts.items():
+        temps = info["temps"]
+        avg_temp = sum(temps) / len(temps)
+        high_temp = max(temps)
+        low_temp = min(temps)
+        # Get most frequent weather description
+        description_counts = {}
+        for desc in info["descriptions"]:
+            description_counts[desc] = description_counts.get(desc, 0) + 1
+        most_frequent_desc = max(description_counts, key=description_counts.get)
+        forecast_summary.append({
+            "date": date,
+            "avg_temp": round(avg_temp, 2),
+            "high_temp": round(high_temp, 2),
+            "low_temp": round(low_temp, 2),
+            "description": most_frequent_desc
+        })
+
+    return {"city": city, "forecast": forecast_summary}
 
 # Function to find warm places
 def find_warm_places(query):
@@ -147,6 +208,12 @@ historical_weather_tool = Tool(
     description="Fetches historical weather highs and lows for a given location and month (e.g., 'Knoxville June'). Returns average high and low temperatures for that month in 2024."
 )
 
+forecast_weather_tool = Tool(
+    name="forecast_weather",
+    func=get_weather_forecast,
+    description="Fetches a 5-day weather forecast for a given location, summarizing daily average temperature and most frequent weather condition. Input example: 'Knoxville'."
+)
+
 # Tool to update user preferences
 def update_user_preferences(input_str):
     prefs = read_user_prefs()
@@ -215,62 +282,105 @@ def get_user_preferences(query):
 
     # Proactively use preferences for weather-related queries
     response = ""
-    if preferred_cities and ("weather" in query.lower() or "find" in query.lower()):
-        # Check weather in preferred cities
-        matching_cities = []
-        non_matching_cities = []
-        for city in preferred_cities:
-            weather = get_current_weather(city)
-            if "error" in weather:
-                continue
-            matches_conditions = True
-            
-            # Check temperature preference
-            if temp_preference == "warm" and weather["temp"] < 75.0:
-                matches_conditions = False
-            elif temp_preference == "cool" and weather["temp"] >= 75.0:
-                matches_conditions = False
+    if preferred_cities:
+        # Handle forecast queries for preferred cities
+        if "forecast" in query.lower():
+            # Acknowledge variations like "this week"
+            time_frame = "5-day"
+            if "this week" in query.lower():
+                time_frame = "next 5 days (this week's forecast)"
+            response += f"Let me check the {time_frame} forecast for your preferred cities:\n"
+            for city in preferred_cities:
+                forecast_data = get_weather_forecast(city)
+                if "error" in forecast_data:
+                    response += f"- {city}: {forecast_data['error']}\n"
+                    continue
+                response += f"\n{city} forecast:\n"
+                for day in forecast_data["forecast"]:
+                    matches_preferences = True
+                    mismatch_reason = ""
+                    # Check if the day's average temperature matches the temperature preference
+                    if temp_preference == "warm" and day["avg_temp"] < 75.0:
+                        matches_preferences = False
+                        mismatch_reason += f" (avg temp {day['avg_temp']}°F too cool for your {temp_preference} preference)"
+                    elif temp_preference == "cool" and day["avg_temp"] >= 75.0:
+                        matches_preferences = False
+                        mismatch_reason += f" (avg temp {day['avg_temp']}°F too warm for your {temp_preference} preference)"
+                    # Check if the day's weather condition matches the preference
+                    if weather_condition_preference:
+                        condition_mappings = {
+                            "sunny": ["sunny", "clear"],
+                            "cloudy": ["cloudy", "overcast"],
+                            "rainy": ["rain", "shower", "drizzle"],
+                            "clear": ["clear", "sunny"]
+                        }
+                        condition_matches = condition_mappings.get(weather_condition_preference.lower(), [weather_condition_preference.lower()])
+                        if not any(condition in day["description"].lower() for condition in condition_matches):
+                            matches_preferences = False
+                            mismatch_reason += f" (not {weather_condition_preference})"
+                    response += f"- {day['date']}: Avg {day['avg_temp']}°F (High {day['high_temp']}°F, Low {day['low_temp']}°F), {day['description']}{mismatch_reason}\n"
+                    if matches_preferences:
+                        response += f"  **This day matches your preferences for {temp_preference} and {weather_condition_preference} weather!**\n"
+            response += "\nWould you like a forecast for another city or more details?"
+            return response.strip()
 
-            # Check weather condition preference with mapping
-            if weather_condition_preference:
-                condition_mappings = {
-                    "sunny": ["sunny", "clear"],
-                    "cloudy": ["cloudy", "overcast"],
-                    "rainy": ["rain", "shower", "drizzle"],
-                    "clear": ["clear", "sunny"]
-                }
-                condition_matches = condition_mappings.get(weather_condition_preference.lower(), [weather_condition_preference.lower()])
-                if not any(condition in weather["description"].lower() for condition in condition_matches):
-                    matches_conditions = False
-
-            if matches_conditions:
-                matching_cities.append(weather)
-            else:
-                non_matching_cities.append(weather)
-
-        # Report matching cities first
-        if matching_cities:
-            response += "Based on your preferences, here are some matching cities:\n"
-            for city_weather in matching_cities:
-                response += f"- {city_weather['city']}: {city_weather['temp']}°F, {city_weather['description']}\n"
-
-        # Always report weather for preferred cities, even if they don't match
-        if preferred_cities:
-            response += "Here’s the current weather in your preferred cities:\n"
-            for city_weather in (matching_cities + non_matching_cities):
+        # Handle current weather queries (as before)
+        if "weather" in query.lower() or "find" in query.lower():
+            matching_cities = []
+            non_matching_cities = []
+            for city in preferred_cities:
+                weather = get_current_weather(city)
+                if "error" in weather:
+                    continue
+                matches_conditions = True
                 mismatch_reason = ""
-                if city_weather not in matching_cities:
-                    if temp_preference == "warm" and city_weather["temp"] < 75.0:
-                        mismatch_reason += f" (too cool for your {temp_preference} preference)"
-                    elif temp_preference == "cool" and city_weather["temp"] >= 75.0:
-                        mismatch_reason += f" (too warm for your {temp_preference} preference)"
-                    if weather_condition_preference and not any(condition in city_weather["description"].lower() for condition in condition_mappings.get(weather_condition_preference.lower(), [weather_condition_preference.lower()])):
+                # Check temperature preference
+                if temp_preference == "warm" and weather["temp"] < 75.0:
+                    matches_conditions = False
+                    mismatch_reason += f" (too cool for your {temp_preference} preference)"
+                elif temp_preference == "cool" and weather["temp"] >= 75.0:
+                    matches_conditions = False
+                    mismatch_reason += f" (too warm for your {temp_preference} preference)"
+                # Check weather condition preference with mapping
+                if weather_condition_preference:
+                    condition_mappings = {
+                        "sunny": ["sunny", "clear"],
+                        "cloudy": ["cloudy", "overcast"],
+                        "rainy": ["rain", "shower", "drizzle"],
+                        "clear": ["clear", "sunny"]
+                    }
+                    condition_matches = condition_mappings.get(weather_condition_preference.lower(), [weather_condition_preference.lower()])
+                    if not any(condition in weather["description"].lower() for condition in condition_matches):
+                        matches_conditions = False
                         mismatch_reason += f" (not {weather_condition_preference})"
-                response += f"- {city_weather['city']}: {city_weather['temp']}°F, {city_weather['description']}{mismatch_reason}\n"
-        else:
-            response += "You haven't set any preferred cities yet. Would you like to add one, like 'I like Tucson'?\n"
+                if matches_conditions:
+                    matching_cities.append(weather)
+                else:
+                    non_matching_cities.append(weather)
 
-        response += "Would you like to check the weather in another city or update your preferences?"
+            # Report matching cities first
+            if matching_cities:
+                response += "Based on your preferences, here are some matching cities:\n"
+                for city_weather in matching_cities:
+                    response += f"- {city_weather['city']}: {city_weather['temp']}°F, {city_weather['description']}\n"
+
+            # Always report weather for preferred cities, even if they don't match
+            if preferred_cities:
+                response += "Here’s the current weather in your preferred cities:\n"
+                for city_weather in (matching_cities + non_matching_cities):
+                    mismatch_reason = ""
+                    if city_weather not in matching_cities:
+                        if temp_preference == "warm" and city_weather["temp"] < 75.0:
+                            mismatch_reason += f" (too cool for your {temp_preference} preference)"
+                        elif temp_preference == "cool" and city_weather["temp"] >= 75.0:
+                            mismatch_reason += f" (too warm for your {temp_preference} preference)"
+                        if weather_condition_preference and not any(condition in city_weather["description"].lower() for condition in condition_mappings.get(weather_condition_preference.lower(), [weather_condition_preference.lower()])):
+                            mismatch_reason += f" (not {weather_condition_preference})"
+                    response += f"- {city_weather['city']}: {city_weather['temp']}°F, {city_weather['description']}{mismatch_reason}\n"
+            else:
+                response += "You haven't set any preferred cities yet. Would you like to add one, like 'I like Tucson'?\n"
+
+            response += "Would you like to check the weather in another city or update your preferences?"
 
     # If query isn't weather-related, list preferences
     if not response:
@@ -287,7 +397,7 @@ def get_user_preferences(query):
 get_preferences_tool = Tool(
     name="get_user_preferences",
     func=get_user_preferences,
-    description="Retrieves the user's stored preferences and proactively provides weather updates for preferred cities, noting if they match temperature and weather condition preferences. Input examples: 'What are my preferences?', 'What's the weather like?', 'Find warm places'."
+    description="Retrieves the user's stored preferences and proactively provides weather updates or forecasts for preferred cities, noting if they match temperature and weather condition preferences. Handles forecast queries for preferred cities. Input examples: 'What are my preferences?', 'What's the weather like?', 'What's the forecast for my preferred cities?'."
 )
 
 # Initialize Grok 3 API with LangChain
@@ -295,22 +405,26 @@ llm = ChatXAI(api_key=GROK3_API_KEY, model="grok-3-mini")
 
 # Create a conversational prompt
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a weather assistant for nomads. Use the tools to answer weather-related queries conversationally. For historical weather, provide the average highs and lows in a clear, friendly format. Use the get_user_preferences tool to check user preferences when relevant (e.g., for weather queries, check preferred cities; for finding warm places, consider temperature preferences). You can also store user preferences like preferred cities or temperature preferences using the update_user_preferences tool."),
+    ("system", "You are a weather assistant for nomads. Use the tools to answer weather-related queries conversationally. For historical weather, provide the average highs and lows in a clear, friendly format. For weather forecasts, include the daily average temperature, high, low, and most frequent weather condition in a detailed, friendly response. Use the get_user_preferences tool to check user preferences when relevant (e.g., for weather queries, check preferred cities; for finding warm places, consider temperature preferences). You can also store user preferences like preferred cities or temperature preferences using the update_user_preferences tool."),
     ("human", "{input}"),
     ("assistant", "{agent_scratchpad}")
 ])
 
 # Create the agent with tools
-tools = [weather_tool, warm_places_tool, historical_weather_tool, update_preferences_tool, get_preferences_tool]
+tools = [weather_tool, warm_places_tool, historical_weather_tool, forecast_weather_tool, update_preferences_tool, get_preferences_tool]
 agent = create_tool_calling_agent(llm=llm, tools=tools, prompt=prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-# Test the conversational agent with enhanced preference-aware queries
+# Test the conversational agent with diverse forecast queries
 queries = [
     "I like Knoxville",
+    "I like Tucson",
     "I like sunny weather",
     "I prefer warm weather",
-    "What's the weather like?",
+    "What's the forecast for Knoxville?",
+    "What's the forecast for my preferred cities?",
+    "What's the forecast for InvalidCity?",
+    "What's the forecast for my preferred cities this week?",
     "What are my preferences?"
 ]
 
